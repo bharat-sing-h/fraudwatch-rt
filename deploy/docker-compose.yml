@@ -1,0 +1,96 @@
+# Whole system on one machine:
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#   docker compose -f deploy/docker-compose.yml run --rm replay        # stream traffic through
+# API: http://localhost:8080/docs   MLflow: http://localhost:5000
+# Redpanda console: http://localhost:8081   Grafana: http://localhost:3000
+x-app: &app
+  build: {context: .., dockerfile: deploy/Dockerfile}
+  image: fraudwatch:latest
+  environment: &env
+    FW_STORE: redis
+    FW_REDIS_URL: redis://redis:6379/0
+    FW_MLFLOW_URI: http://mlflow:5000
+    FW_KAFKA: redpanda:9092
+  volumes: ["fw-data:/work/data"]
+
+services:
+  redpanda:   # Kafka-API compatible, single binary, no ZooKeeper
+    image: redpandadata/redpanda:v24.2.7
+    command: [redpanda, start, --overprovisioned, --smp=1, --memory=1G, --mode=dev-container,
+              --kafka-addr=PLAINTEXT://0.0.0.0:9092, --advertise-kafka-addr=PLAINTEXT://redpanda:9092]
+    healthcheck:
+      test: ["CMD", "rpk", "cluster", "health", "--exit-when-healthy"]
+      interval: 5s
+      retries: 30
+
+  console:
+    image: redpandadata/console:v2.7.2
+    environment: {KAFKA_BROKERS: redpanda:9092}
+    ports: ["8081:8080"]
+    depends_on: {redpanda: {condition: service_healthy}}
+
+  redis:      # online feature store
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, "yes"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s}
+
+  mlflow:     # tracking server + model registry; same image => client/server versions match
+    <<: *app
+    command: [mlflow, server, --host, 0.0.0.0, --port, "5000",
+              --backend-store-uri, sqlite:////mlflow/mlflow.db,
+              --artifacts-destination, /mlflow/artifacts, --serve-artifacts]
+    volumes: ["mlflow:/mlflow"]
+    ports: ["5000:5000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      retries: 30
+
+  bootstrap:  # one-shot: simulate history, build features, train + register champion, load profiles
+    <<: *app
+    command: >
+      sh -c "fw simulate --data data --days 90 &&
+             fw features --data data &&
+             fw train --data data --alias champion &&
+             fw load-profiles --data data"
+    depends_on:
+      redis: {condition: service_healthy}
+      mlflow: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["8080:8080"]
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+    healthcheck: {test: ["CMD", "curl", "-fsS", "localhost:8080/healthz"], interval: 10s}
+
+  worker:     # Kafka: transactions -> decisions, labels -> feature state
+    <<: *app
+    command: [fw, stream]
+    depends_on:
+      bootstrap: {condition: service_completed_successfully}
+      redpanda: {condition: service_healthy}
+
+  replay:     # publishes days 70+ of simulated traffic (and fraud reports) to Kafka
+    <<: *app
+    command: [fw, replay, --data, data, --start-day, "70", --speedup, "3600"]
+    profiles: [replay]
+    depends_on: {redpanda: {condition: service_healthy}}
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes: ["./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment: {GF_AUTH_ANONYMOUS_ENABLED: "true", GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+volumes:
+  fw-data:
+  mlflow:

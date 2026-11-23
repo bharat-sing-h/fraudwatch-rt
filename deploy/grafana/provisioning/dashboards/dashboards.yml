@@ -1,0 +1,6 @@
+apiVersion: 1
+providers:
+  - name: fraudwatch
+    folder: fraudwatch
+    type: file
+    options: {path: /var/lib/grafana/dashboards}
